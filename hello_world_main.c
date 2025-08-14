@@ -1,76 +1,62 @@
-/*
- * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
-#include <inttypes.h>
-#include "sdkconfig.h"
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_system.h"
-
-#include <stdio.h>
 #include "driver/gpio.h"
+#include "driver/pcnt.h"
 #include "esp_log.h"
 
 #define ENCODER_A GPIO_NUM_18
 #define ENCODER_B GPIO_NUM_19
 
 static const char *TAG = "ENCODER";
+static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;
 
-volatile long encoder_count = 0;
-volatile int last_encoded = 0;
+static void encoder_init(void) {
+    pcnt_config_t pcnt_config = {
+    .pulse_gpio_num = ENCODER_A,   // A 相
+    .ctrl_gpio_num = ENCODER_B,    // B 相
+    .lctrl_mode = PCNT_MODE_KEEP,    // B 相低电平时保持方向
+    .hctrl_mode = PCNT_MODE_REVERSE, // B 相高电平时反向
+    .pos_mode = PCNT_COUNT_INC,      // 上升沿 +1
+    .neg_mode = PCNT_COUNT_DEC,      // 下降沿 -1
+    .counter_h_lim = 32767,
+    .counter_l_lim = -32768,
+    .unit = pcnt_unit,
+    .channel = PCNT_CHANNEL_0
+};
 
-static void IRAM_ATTR encoder_isr_handler(void* arg) {
-    static int lastA = 0;
-    int A = gpio_get_level(ENCODER_A);
-    int B = gpio_get_level(ENCODER_B);
 
-    // 只在 A 相从低变高时判断方向
-    if (A != lastA && A == 1) {
-        if (B == 0) {
-            encoder_count++; // 顺时针
-        } else {
-            encoder_count--; // 逆时针
-        }
-    }
-    lastA = A;
+    pcnt_unit_config(&pcnt_config);
+
+    // 启用硬件滤波器（1us）
+    pcnt_set_filter_value(pcnt_unit, 1000); 
+    pcnt_filter_enable(pcnt_unit);
+
+    // 清零并启动
+    pcnt_counter_pause(pcnt_unit);
+    pcnt_counter_clear(pcnt_unit);
+    pcnt_counter_resume(pcnt_unit);
 }
-
 
 void app_main(void) {
-    ESP_LOGI(TAG, "启动旋转编码器测试");
+    ESP_LOGI(TAG, "初始化旋转编码器");
+    encoder_init();
 
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_ANYEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << ENCODER_A) | (1ULL << ENCODER_B),
-        .pull_down_en = 0,
-        .pull_up_en = 1
-    };
-    gpio_config(&io_conf);
-
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(ENCODER_A, encoder_isr_handler, NULL);
-    gpio_isr_handler_add(ENCODER_B, encoder_isr_handler, NULL);
-
-    long last_count = 0;
+    int16_t count = 0;
+    int16_t last_count = 0;
 
     while (1) {
-        if (encoder_count != last_count) {
-            long delta = encoder_count - last_count;
+        pcnt_get_counter_value(pcnt_unit, &count);
+        count /= 2; // 每两个脉冲算一步
+        if (count != last_count) {
+            int delta = count - last_count;
             if (delta > 0) {
-                ESP_LOGI(TAG, "方向: 顺时针, 步数: %ld, 总计: %ld", delta, encoder_count);
+                ESP_LOGI(TAG, "方向: 顺时针, 步数: %d, 总计: %d", delta, count);
             } else {
-                ESP_LOGI(TAG, "方向: 逆时针, 步数: %ld, 总计: %ld", -delta, encoder_count);
+                ESP_LOGI(TAG, "方向: 逆时针, 步数: %d, 总计: %d", -delta, count);
             }
-            last_count = encoder_count;
+            last_count = count;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
-
-
