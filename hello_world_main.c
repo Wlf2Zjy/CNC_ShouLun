@@ -19,15 +19,13 @@
 #define RIGHT_SW3 GPIO_NUM_20
 
 static const char *TAG = "ENCODER";
-
 static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;
 
-// 四轴累计计数（单位：步）
-static volatile float axis_counts[4] = {0, 0, 0, 0};
-// 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=A
-static volatile int current_axis = 0;
-// 右拨档倍率
-static volatile float right_multiplier = 1.0f;
+// ==================== 四轴累计计数 & 周期增量缓存 ====================
+static volatile float axis_counts[4] = {0, 0, 0, 0}; // 累计位置
+static volatile float delta_counts[4] = {0, 0, 0, 0}; // 周期内增量
+static volatile int current_axis = 0;                 // 当前选择轴：0=X,1=Y,2=Z,3=A
+static volatile float right_multiplier = 1.0f;        // 右拨档倍率
 
 // ==================== 编码器初始化 ====================
 static void encoder_init(void) {
@@ -43,7 +41,6 @@ static void encoder_init(void) {
         .unit = pcnt_unit,
         .channel = PCNT_CHANNEL_0
     };
-
     pcnt_unit_config(&pcnt_config);
     pcnt_set_filter_value(pcnt_unit, 1000);
     pcnt_filter_enable(pcnt_unit);
@@ -110,23 +107,16 @@ static type read_switch_stable_##type(type (*read_func)(void), type last_value) 
 DEFINE_SWITCH_STABLE(char)
 DEFINE_SWITCH_STABLE(float)
 
-// ==================== 编码器任务（直接读PCNT） ====================
+// ==================== 编码器任务（累加位置 + 周期增量） ====================
 static void encoder_task(void *arg) {
     int16_t raw_count = 0;
     while (1) {
         pcnt_get_counter_value(pcnt_unit, &raw_count);
         if (raw_count != 0) {
             pcnt_counter_clear(pcnt_unit);
-
             float scaled_steps = (raw_count / 2.0f) * right_multiplier;
-            int axis = current_axis;
-
-            axis_counts[axis] += scaled_steps;
-
-            const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
-            ESP_LOGI(TAG, "轴: %c, 增量: %.2f (倍率×%.1f), 累计位置: %.2f | 全部轴位置: X=%.2f Y=%.2f Z=%.2f A=%.2f",
-                     axis_names[axis], scaled_steps, right_multiplier, axis_counts[axis],
-                     axis_counts[0], axis_counts[1], axis_counts[2], axis_counts[3]);
+            axis_counts[current_axis] += scaled_steps;
+            delta_counts[current_axis] += scaled_steps; // 缓存周期增量
         }
         vTaskDelay(pdMS_TO_TICKS(10)); // 10ms 轮询
     }
@@ -161,13 +151,40 @@ static void switch_task(void *arg) {
     }
 }
 
+// ==================== 定时输出任务（每 50ms 输出一次） ====================
+static void output_task(void *arg) {
+    const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
+    while (1) {
+        int axis = current_axis;
+
+        float delta = delta_counts[axis];
+        float posX = axis_counts[0];
+        float posY = axis_counts[1];
+        float posZ = axis_counts[2];
+        float posA = axis_counts[3];
+
+        ESP_LOGI(TAG, "轴: %c, 增量: %.2f (倍率×%.1f), 累计位置: %.2f | 全部轴位置: X=%.2f Y=%.2f Z=%.2f A=%.2f",
+                 axis_names[axis], delta, right_multiplier, axis_counts[axis],
+                 posX, posY, posZ, posA);
+
+        // 清空所有轴的周期增量
+        delta_counts[0] = 0;
+        delta_counts[1] = 0;
+        delta_counts[2] = 0;
+        delta_counts[3] = 0;
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // 50ms 周期输出
+    }
+}
+
 // ==================== 主程序 ====================
 void app_main(void) {
-    ESP_LOGI(TAG, "初始化旋转编码器 + 拨档开关（四轴计数系统）");
+    ESP_LOGI(TAG, "初始化旋转编码器 + 拨档开关");
 
     encoder_init();
     switch_init();
 
     xTaskCreate(encoder_task, "encoder_task", 4096, NULL, 5, NULL);
     xTaskCreate(switch_task, "switch_task", 2048, NULL, 5, NULL);
+    xTaskCreate(output_task, "output_task", 4096, NULL, 5, NULL);
 }
