@@ -5,6 +5,9 @@
 #include "driver/pcnt.h"        // ESP32脉冲计数器驱动程序
 #include "esp_log.h"
 #include <math.h>
+#include "driver/uart.h"         // UART 驱动
+#include <string.h>
+#include "serial.h"             // 串口通信相关函数
 
 // ==================== 硬件引脚定义 ====================
 #define ENCODER_A GPIO_NUM_18  // 编码器A相引脚
@@ -34,12 +37,17 @@ A 相跳变 = 数一格
 #define LEFT_SW1 GPIO_NUM_3    // X轴选择开关
 #define LEFT_SW2 GPIO_NUM_4    // Y轴选择开关
 #define LEFT_SW3 GPIO_NUM_5    // Z轴选择开关
-#define LEFT_SW4 GPIO_NUM_9    // F轴选择开关
+#define LEFT_SW4 GPIO_NUM_9    // A轴选择开关
 
 // 右拨档开关引脚（选择倍率）
 #define RIGHT_SW1 GPIO_NUM_0   // ×0.1倍率选择开关
 #define RIGHT_SW2 GPIO_NUM_23  // ×1.0倍率选择开关
 #define RIGHT_SW3 GPIO_NUM_20  // ×5.0倍率选择开关
+
+#define UART_PORT_NUM      UART_NUM_0
+#define UART_TX_PIN        GPIO_NUM_21
+#define UART_RX_PIN        GPIO_NUM_22
+#define UART_BAUD_RATE     115200
 
 static const char *TAG = "ENCODER";  // 日志标签
 static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;  // 使用的脉冲计数器单元
@@ -49,7 +57,7 @@ static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;  // 使用的脉冲计数器单元
 static volatile float axis_counts[4] = {0, 0, 0, 0};
 // 上次输出时的累计值，用于计算本次运动的增量
 static volatile float axis_last_report[4] = {0, 0, 0, 0};
-// 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=F
+// 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=A
 static volatile int current_axis = 0;
 // 右拨档倍率
 static volatile float right_multiplier = 1.0f;
@@ -77,6 +85,41 @@ static void encoder_init(void) {
     pcnt_counter_resume(pcnt_unit);
 }
 
+// ==================== UART 初始化 ====================
+static void uart_init(void) {
+    const uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_driver_install(UART_PORT_NUM, 1024, 0, 0, NULL, 0);
+    uart_param_config(UART_PORT_NUM, &uart_config);
+    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+// ==================== 发送指令帧 ====================
+static void send_command_frame(float total_delta, int axis_index) {
+    char cmd[128];
+    float x = 0, y = 0, z = 0,A = 0;
+    float feedrate = 100.0f;   // 默认移动速度
+
+    switch (axis_index) {
+        case 0: x = total_delta; break;
+        case 1: y = total_delta; break;
+        case 2: z = total_delta; break;
+        case 3: A = total_delta; break; 
+    }
+
+    snprintf(cmd, sizeof(cmd), "$J=G21G91X%.2fY%.2fZ%.2fA%.2fF%.1f\n",
+             x, y, z, A,feedrate);
+
+    uart_write_bytes(UART_PORT_NUM, cmd, strlen(cmd));
+    //ESP_LOGI(TAG, "发送指令: %s", cmd);
+}
+
 // ==================== 拨档初始化 ====================
 static void switch_init(void) {
     gpio_config_t io_conf = {
@@ -102,7 +145,7 @@ static char read_left_switch_raw(void) {
     if (gpio_get_level(LEFT_SW1) == 0) return 'X';
     if (gpio_get_level(LEFT_SW2) == 0) return 'Y';
     if (gpio_get_level(LEFT_SW3) == 0) return 'Z';
-    if (gpio_get_level(LEFT_SW4) == 0) return 'F';
+    if (gpio_get_level(LEFT_SW4) == 0) return 'A';
     return 0;  //无开关按下
 }
 
@@ -141,7 +184,7 @@ DEFINE_SWITCH_STABLE(float)
 // 每 50ms 检查一次，如果运动结束则输出相对于上次运动的增量
 static void encoder_poll_task(void *arg) {
     int16_t raw_count = 0;
-    const char axis_names[4] = {'X', 'Y', 'Z', 'F'};
+    const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
     int inactive_counter = 0;
     const int INACTIVE_THRESHOLD = 2; // 100ms无活动视为停止
 
@@ -166,8 +209,13 @@ static void encoder_poll_task(void *arg) {
                 // 运动结束处理
                 float total_delta = axis_counts[current_axis] - axis_last_report[current_axis];
                 if (fabsf(total_delta) > 0.001f) {
-                    ESP_LOGI(TAG, "[运动结束] 轴: %c,倍率: ×%.1f, 本次位移: %.2f", 
-                             axis_names[current_axis], right_multiplier, total_delta);
+                    /*ESP_LOGI(TAG, "[运动结束] 轴: %c, 本次位移: %.2f", 
+                             axis_names[current_axis],  total_delta);*/
+                             
+                    //ESP_LOGI(TAG, "[运动结束] 轴: %c,倍率: ×%.1f, 本次位移: %.2f", 
+                            // axis_names[current_axis], right_multiplier, total_delta);
+                    // 发送指令帧
+                    send_command_frame(total_delta, current_axis);
                     axis_last_report[current_axis] = axis_counts[current_axis];
                 }
                 inactive_counter++; // 防止重复输出
@@ -193,14 +241,14 @@ static void switch_task(void *arg) {
                     case 'X': current_axis = 0; break;
                     case 'Y': current_axis = 1; break;
                     case 'Z': current_axis = 2; break;
-                    case 'F': current_axis = 3; break;
+                    case 'A': current_axis = 3; break;
                 }
-                ESP_LOGI(TAG, "切换到轴: %c", new_left);
+                //ESP_LOGI(TAG, "切换到轴: %c", new_left);
             }
             if (new_right != 0.0f) {
                 right_pos = new_right;
                 right_multiplier = right_pos;
-                ESP_LOGI(TAG, "倍率调整: ×%.1f", right_pos);
+                //ESP_LOGI(TAG, "倍率调整: ×%.1f", right_pos);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -211,6 +259,7 @@ static void switch_task(void *arg) {
 void app_main(void) {
     ESP_LOGI(TAG, "初始化旋转编码器 + 拨档开关");
 
+    uart_init();
     encoder_init();
     switch_init();
     //serial3_init();
