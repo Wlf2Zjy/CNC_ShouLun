@@ -10,11 +10,31 @@
 #define ENCODER_A GPIO_NUM_18  // 编码器A相引脚
 #define ENCODER_B GPIO_NUM_19  // 编码器B相引脚
 
+/*A 相和 B 相是旋转编码器输出的两个脉冲信号：
+
+A 相（CLK）：输出脉冲用来计数旋转的步数，每转动一下就会跳变一次。
+
+B 相（DT）：用来判断旋转方向。它和 A 相的跳变先后顺序不同，表示顺时针或逆时针。
+
+简单记忆法：
+
+A 相跳变 = 数一格
+
+看 B 相此时是高还是低 = 判断是加还是减
+
+例子说明：
+
+如果 A 先变、B 后变，就是顺时针（数值增加）
+
+如果 B 先变、A 后变，就是逆时针（数值减少）
+
+*/
+
 // 左拨档开关引脚（选择轴）
 #define LEFT_SW1 GPIO_NUM_3    // X轴选择开关
 #define LEFT_SW2 GPIO_NUM_4    // Y轴选择开关
 #define LEFT_SW3 GPIO_NUM_5    // Z轴选择开关
-#define LEFT_SW4 GPIO_NUM_9    // A轴选择开关
+#define LEFT_SW4 GPIO_NUM_9    // F轴选择开关
 
 // 右拨档开关引脚（选择倍率）
 #define RIGHT_SW1 GPIO_NUM_0   // ×0.1倍率选择开关
@@ -29,7 +49,7 @@ static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;  // 使用的脉冲计数器单元
 static volatile float axis_counts[4] = {0, 0, 0, 0};
 // 上次输出时的累计值，用于计算本次运动的增量
 static volatile float axis_last_report[4] = {0, 0, 0, 0};
-// 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=A
+// 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=F
 static volatile int current_axis = 0;
 // 右拨档倍率
 static volatile float right_multiplier = 1.0f;
@@ -82,7 +102,7 @@ static char read_left_switch_raw(void) {
     if (gpio_get_level(LEFT_SW1) == 0) return 'X';
     if (gpio_get_level(LEFT_SW2) == 0) return 'Y';
     if (gpio_get_level(LEFT_SW3) == 0) return 'Z';
-    if (gpio_get_level(LEFT_SW4) == 0) return 'A';
+    if (gpio_get_level(LEFT_SW4) == 0) return 'F';
     return 0;  //无开关按下
 }
 
@@ -113,7 +133,7 @@ static type read_switch_stable_##type(type (*read_func)(void), type last_value) 
     } \
     return (count_same >= 3) ? stable_value : last_value; \
 }
-
+/*拨档档位的防抖，只有大于三次是同一个档位才输出*/
 DEFINE_SWITCH_STABLE(char)
 DEFINE_SWITCH_STABLE(float)
 
@@ -121,7 +141,7 @@ DEFINE_SWITCH_STABLE(float)
 // 每 50ms 检查一次，如果运动结束则输出相对于上次运动的增量
 static void encoder_poll_task(void *arg) {
     int16_t raw_count = 0;
-    const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
+    const char axis_names[4] = {'X', 'Y', 'Z', 'F'};
     int inactive_counter = 0;
     const int INACTIVE_THRESHOLD = 2; // 100ms无活动视为停止
 
@@ -146,7 +166,7 @@ static void encoder_poll_task(void *arg) {
                 // 运动结束处理
                 float total_delta = axis_counts[current_axis] - axis_last_report[current_axis];
                 if (fabsf(total_delta) > 0.001f) {
-                    ESP_LOGI(TAG, "[运动结束] 轴: %c,倍率: ×%.1f, 总位移: %.2f", 
+                    ESP_LOGI(TAG, "[运动结束] 轴: %c,倍率: ×%.1f, 本次位移: %.2f", 
                              axis_names[current_axis], right_multiplier, total_delta);
                     axis_last_report[current_axis] = axis_counts[current_axis];
                 }
@@ -173,7 +193,7 @@ static void switch_task(void *arg) {
                     case 'X': current_axis = 0; break;
                     case 'Y': current_axis = 1; break;
                     case 'Z': current_axis = 2; break;
-                    case 'A': current_axis = 3; break;
+                    case 'F': current_axis = 3; break;
                 }
                 ESP_LOGI(TAG, "切换到轴: %c", new_left);
             }
@@ -193,6 +213,7 @@ void app_main(void) {
 
     encoder_init();
     switch_init();
+    //serial3_init();
 
     // 编码器轮询任务（优先级5，栈大小4096字节）
     xTaskCreate(encoder_poll_task, "encoder_poll_task", 4096, NULL, 5, NULL);
