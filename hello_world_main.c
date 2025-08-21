@@ -7,7 +7,7 @@
 #include <math.h>
 #include "driver/uart.h"         // UART 驱动
 #include <string.h>
-#include "serial.h"             // 串口通信相关函数
+
 
 // ==================== 硬件引脚定义 ====================
 #define ENCODER_A GPIO_NUM_18  // 编码器A相引脚
@@ -101,16 +101,16 @@ static void uart_init(void) {
 }
 
 // ==================== 发送指令帧 ====================
-static void send_command_frame(float total_delta, int axis_index) {
+static void send_command_frame(float scaled_steps, int axis_index) {
     char cmd[128];
     float x = 0, y = 0, z = 0,A = 0;
-    float feedrate = 100.0f;   // 默认移动速度
+    float feedrate = 3000.0f;   // 默认移动速度
 
     switch (axis_index) {
-        case 0: x = total_delta; break;
-        case 1: y = total_delta; break;
-        case 2: z = total_delta; break;
-        case 3: A = total_delta; break; 
+        case 0: x = scaled_steps; break;
+        case 1: y = scaled_steps; break;
+        case 2: z = scaled_steps; break;
+        case 3: A = scaled_steps; break; 
     }
 
     snprintf(cmd, sizeof(cmd), "$J=G21G91X%.2fY%.2fZ%.2fA%.2fF%.1f\n",
@@ -181,48 +181,34 @@ DEFINE_SWITCH_STABLE(char)
 DEFINE_SWITCH_STABLE(float)
 
 // ==================== 编码器轮询任务 ====================
-// 每 50ms 检查一次，如果运动结束则输出相对于上次运动的增量
+//每50ms检测一次，有位移就输出，没有位移就不输出
 static void encoder_poll_task(void *arg) {
     int16_t raw_count = 0;
     const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
-    int inactive_counter = 0;
-    const int INACTIVE_THRESHOLD = 2; // 100ms无活动视为停止
-
     while (1) {
+        // 获取当前脉冲计数值
         pcnt_get_counter_value(pcnt_unit, &raw_count);
-        pcnt_counter_clear(pcnt_unit); // 清零计数器
-
+        
+        // 如果有脉冲，处理并输出增量
         if (raw_count != 0) {
-            // 除以2.0f是因为每个完整周期有2个脉冲（A相和B相）
+            // // 除以2.0f是因为每个完整周期有2个脉冲（A相和B相）
             float scaled_steps = (raw_count / 2.0f) * right_multiplier;
+            
+            // 累加到当前轴的总位移
             axis_counts[current_axis] += scaled_steps;
             
-            // 实时输出增量
-           // ESP_LOGI(TAG, "轴: %c, 倍率: ×%.1f, 实时增量: %.2f", 
+            // 输出增量信息
+            //ESP_LOGI(TAG, "轴: %c, 倍率: ×%.1f, 增量: %.2f", 
                      //axis_names[current_axis], right_multiplier, scaled_steps);
-            
-            inactive_counter = 0; // 重置不活动计数器
-        } else {
-            if (inactive_counter < INACTIVE_THRESHOLD) {
-                inactive_counter++;
-            } else if (inactive_counter == INACTIVE_THRESHOLD) {
-                // 运动结束处理
-                float total_delta = axis_counts[current_axis] - axis_last_report[current_axis];
-                if (fabsf(total_delta) > 0.001f) {
-                    /*ESP_LOGI(TAG, "[运动结束] 轴: %c, 本次位移: %.2f", 
-                             axis_names[current_axis],  total_delta);*/
-                             
-                    //ESP_LOGI(TAG, "[运动结束] 轴: %c,倍率: ×%.1f, 本次位移: %.2f", 
-                            // axis_names[current_axis], right_multiplier, total_delta);
-                    // 发送指令帧
-                    send_command_frame(total_delta, current_axis);
+            // 发送指令帧
+                    send_command_frame(scaled_steps, current_axis);
                     axis_last_report[current_axis] = axis_counts[current_axis];
-                }
-                inactive_counter++; // 防止重复输出
-            }
+            // 清除计数器
+            pcnt_counter_clear(pcnt_unit);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(50));   // 每50ms轮询一次
+        
+        // 等待20ms进行下一次检测
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
