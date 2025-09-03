@@ -10,8 +10,8 @@
 
 
 // ==================== 硬件引脚定义 ====================
-#define ENCODER_A GPIO_NUM_18  // 编码器A相引脚
-#define ENCODER_B GPIO_NUM_19  // 编码器B相引脚
+#define ENCODER_A GPIO_NUM_1  // 编码器A相引脚
+#define ENCODER_B GPIO_NUM_0  // 编码器B相引脚
 
 /*A 相和 B 相是旋转编码器输出的两个脉冲信号：
 
@@ -34,27 +34,36 @@ A 相跳变 = 数一格
 */
 
 // 左拨档开关引脚（选择轴）
-#define LEFT_SW1 GPIO_NUM_3    // X轴选择开关
-#define LEFT_SW2 GPIO_NUM_4    // Y轴选择开关
-#define LEFT_SW3 GPIO_NUM_5    // Z轴选择开关
-#define LEFT_SW4 GPIO_NUM_9    // A轴选择开关
+#define LEFT_SW1 GPIO_NUM_4    // X轴选择开关
+#define LEFT_SW2 GPIO_NUM_5    // Y轴选择开关
+#define LEFT_SW3 GPIO_NUM_3    // Z轴选择开关
+#define LEFT_SW4 GPIO_NUM_2    // A轴选择开关
 
 // 右拨档开关引脚（选择倍率）
-#define RIGHT_SW1 GPIO_NUM_0   // ×0.1倍率选择开关
-#define RIGHT_SW2 GPIO_NUM_23  // ×1.0倍率选择开关
-#define RIGHT_SW3 GPIO_NUM_20  // ×5.0倍率选择开关
+#define RIGHT_SW1 GPIO_NUM_9   // ×0.1倍率选择开关
+#define RIGHT_SW2 GPIO_NUM_18  // ×1.0倍率选择开关
+#define RIGHT_SW3 GPIO_NUM_19  // ×5.0倍率选择开关
 
 #define UART_PORT_NUM      UART_NUM_0
 #define UART_TX_PIN        GPIO_NUM_21
 #define UART_RX_PIN        GPIO_NUM_22
 #define UART_BAUD_RATE     115200
 
+#define ESTOP_PIN GPIO_NUM_23   // 急停按钮引脚
+#define ESTOP_DEBOUNCE_MS 50    // 防抖时间 50ms
+
+#define FUNC_BTN_PIN GPIO_NUM_20   // 功能按键
+
 static const char *TAG = "ENCODER";  // 日志标签
 static pcnt_unit_t pcnt_unit = PCNT_UNIT_0;  // 使用的脉冲计数器单元
+static volatile bool estop_triggered = false;  // 急停状态标志（true = 已急停，false = 正常）
+static volatile uint32_t last_estop_tick = 0;  // 记录上次中断触发时间（tick）
+static void IRAM_ATTR estop_isr_handler(void* arg);
+static void IRAM_ATTR func_btn_isr_handler(void* arg);
 
 // ==================== 四轴累计计数（单位：步） ====================
 // 累计总位移
-static volatile float axis_counts[4] = {0, 0, 0, 0};
+static volatile float axis_counts[4] = {0, 0, 0, 0};    
 // 上次输出时的累计值，用于计算本次运动的增量
 static volatile float axis_last_report[4] = {0, 0, 0, 0};
 // 当前选择的轴索引：0=X, 1=Y, 2=Z, 3=A
@@ -100,8 +109,77 @@ static void uart_init(void) {
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
+// ==================== 功能按键初始化 ====================
+static void func_btn_init(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,  // 下降沿触发（按下）
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << FUNC_BTN_PIN),
+        .pull_up_en = 1,   // 开启上拉
+        .pull_down_en = 0
+    };
+    gpio_config(&io_conf);
+
+    // 注册中断
+    gpio_isr_handler_add(FUNC_BTN_PIN, func_btn_isr_handler, NULL);
+}
+
+// ==================== 急停GPIO初始化 ====================
+static void estop_init(void) {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_ANYEDGE,  // 上升沿+下降沿都触发
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << ESTOP_PIN),
+        .pull_up_en = 1,   // 开启上拉
+        .pull_down_en = 0
+    };
+    gpio_config(&io_conf);
+
+    // 安装GPIO中断服务
+    gpio_install_isr_service(0);
+    // 注册中断处理函数
+    gpio_isr_handler_add(ESTOP_PIN, estop_isr_handler, NULL);
+}
+
+// ==================== 急停中断服务函数 ====================
+static void IRAM_ATTR estop_isr_handler(void* arg) {
+    uint32_t now_tick = xTaskGetTickCountFromISR();
+    if ((now_tick - last_estop_tick) < pdMS_TO_TICKS(ESTOP_DEBOUNCE_MS)) {
+        return;  // 在防抖时间内，忽略
+    }
+    last_estop_tick = now_tick;
+
+    int level = gpio_get_level(ESTOP_PIN);
+
+    if (level == 0) {  
+        // 按钮按下（假设低电平有效）
+        estop_triggered = true;
+        const char stop_cmd = 0x18;  // GRBL 急停指令
+        uart_write_bytes(UART_PORT_NUM, &stop_cmd, 1);
+        //ESP_EARLY_LOGW(TAG, "急停触发，发送0x18");
+    } else {  
+        // 按钮松开
+        estop_triggered = false;
+        const char *unlock_cmd = "$X\n";  // GRBL 解锁指令
+        uart_write_bytes(UART_PORT_NUM, unlock_cmd, strlen(unlock_cmd));
+        //ESP_EARLY_LOGI(TAG, "急停解除，发送$X");
+    }
+}
+
+// ==================== 功能按键中断回调 ====================
+static void IRAM_ATTR func_btn_isr_handler(void* arg) {
+    // 这里直接发一个测试指令 "1\n"
+    const char *test_cmd = "1\n";
+    uart_write_bytes(UART_PORT_NUM, test_cmd, strlen(test_cmd));
+    //ESP_EARLY_LOGI(TAG, "功能按键触发，发送测试指令: %s", test_cmd);
+}
+
 // ==================== 发送指令帧 ====================
 static void send_command_frame(float scaled_steps, int axis_index) {
+    if (estop_triggered) {
+        // 急停状态下不再发送运动指令
+        return;
+    }
     char cmd[128];
     float x = 0, y = 0, z = 0,A = 0;
     float feedrate = 3000.0f;   // 默认移动速度
@@ -181,7 +259,7 @@ DEFINE_SWITCH_STABLE(char)
 DEFINE_SWITCH_STABLE(float)
 
 // ==================== 编码器轮询任务 ====================
-//每50ms检测一次，有位移就输出，没有位移就不输出
+//每20ms检测一次，有位移就输出，没有位移就不输出
 static void encoder_poll_task(void *arg) {
     int16_t raw_count = 0;
     const char axis_names[4] = {'X', 'Y', 'Z', 'A'};
@@ -199,7 +277,7 @@ static void encoder_poll_task(void *arg) {
             
             // 输出增量信息
             //ESP_LOGI(TAG, "轴: %c, 倍率: ×%.1f, 增量: %.2f", 
-                     //axis_names[current_axis], right_multiplier, scaled_steps);
+                    // axis_names[current_axis], right_multiplier, scaled_steps);
             // 发送指令帧
                     send_command_frame(scaled_steps, current_axis);
                     axis_last_report[current_axis] = axis_counts[current_axis];
@@ -248,6 +326,8 @@ void app_main(void) {
     uart_init();
     encoder_init();
     switch_init();
+    estop_init();   // 初始化急停按键
+    func_btn_init();   // 初始化功能按键
     //serial3_init();
 
     // 编码器轮询任务（优先级5，栈大小4096字节）
